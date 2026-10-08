@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import copy
+import os
 import json
 import re
 import sqlite3
@@ -241,17 +243,28 @@ def decide(s: dict) -> str:
 
 
 # --------------------------------------------------------------------------- extraction HTML
+MAX_REMOVABLE_WORDS = 300  # un bandeau cookies ou un formulaire est court ; au-delà c'est un conteneur de la page
+
+
+def _is_small(tag) -> bool:
+    return len(tag.get_text(" ", strip=True).split()) <= MAX_REMOVABLE_WORDS
+
+
 def extract_text(soup: BeautifulSoup) -> str:
-    for tag in soup(["script", "style", "noscript", "svg", "iframe", "template", "canvas", "form", "button"]):
+    for tag in soup(["script", "style", "noscript", "svg", "iframe", "template", "canvas"]):
         tag.decompose()
+    # Certains sites (ASP.NET) englobent toute la page dans un <form> : on ne retire que les petits.
+    for tag in soup(["form", "button"]):
+        if not getattr(tag, "decomposed", False) and _is_small(tag):
+            tag.decompose()
     for tag in soup.find_all(True):
-        if getattr(tag, "decomposed", False):
-            continue
+        if getattr(tag, "decomposed", False) or tag.name in ("html", "body", "main"):
+            continue  # des thèmes WordPress mettent des classes "cookie"/"cmplz" sur <html> ou <body>
         attrs = getattr(tag, "attrs", None)
         if not attrs:
             continue
         ident = " ".join([str(attrs.get("id", ""))] + [str(c) for c in attrs.get("class", []) or []])
-        if ident.strip() and CONSENT_PATTERN.search(ident):
+        if ident.strip() and CONSENT_PATTERN.search(ident) and _is_small(tag):
             tag.decompose()
     parts = []
     if soup.title and soup.title.string:
@@ -328,8 +341,9 @@ class Fetcher:
         self.robots: dict[str, RobotFileParser | None] = {}
         self.robots_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-    async def _request(self, url: str) -> httpx.Response:
-        """Une seule requête HTTP, avec ≥1 s entre deux requêtes vers le même hôte et ≤10 en parallèle."""
+    @contextlib.asynccontextmanager
+    async def host_slot(self, url: str):
+        """Créneau pour une requête : ≥1 s entre deux requêtes vers le même hôte et ≤10 en parallèle."""
         host = (urlparse(url).hostname or "").lower()
         async with self.host_locks[host]:
             wait = self.host_last.get(host, 0) + MIN_DELAY_PER_DOMAIN - time.monotonic()
@@ -338,19 +352,24 @@ class Fetcher:
             async with self.global_sem:
                 self.host_last[host] = time.monotonic()
                 try:
-                    async with self.client.stream("GET", url) as r:
-                        chunks, size = [], 0
-                        ctype = r.headers.get("content-type", "")
-                        if r.status_code < 300 and any(t in ctype for t in ("html", "xml", "text/plain")):
-                            async for chunk in r.aiter_bytes():
-                                chunks.append(chunk)
-                                size += len(chunk)
-                                if size > MAX_BYTES:
-                                    break
-                        r._content = b"".join(chunks)
-                        return r
+                    yield
                 finally:
                     self.host_last[host] = time.monotonic()
+
+    async def _request(self, url: str) -> httpx.Response:
+        """Une seule requête HTTP (sans suivre les redirections)."""
+        async with self.host_slot(url):
+            async with self.client.stream("GET", url) as r:
+                chunks, size = [], 0
+                ctype = r.headers.get("content-type", "")
+                if r.status_code < 300 and any(t in ctype for t in ("html", "xml", "text/plain")):
+                    async for chunk in r.aiter_bytes():
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > MAX_BYTES:
+                            break
+                r._content = b"".join(chunks)
+                return r
 
     async def get(self, url: str) -> httpx.Response:
         """GET avec redirections suivies manuellement (pour appliquer la limite par hôte à chaque saut)."""
@@ -504,6 +523,88 @@ async def crawl_all(sites: list[str], cache: Cache) -> None:
         await asyncio.gather(*(one(s) for s in sites))
 
 
+# --------------------------------------------------------------------------- rendu JavaScript (Playwright)
+RENDER_PARALLEL = 3  # onglets Chromium simultanés (chacun charge aussi scripts et feuilles de style)
+RENDER_WAIT_IDLE_MS = 8000
+BLOCKED_RESOURCES = {"image", "media", "font"}
+
+
+async def render_page(fetcher: Fetcher, context, url: str) -> tuple[str, BeautifulSoup | None, str | None]:
+    """Charge une page dans Chromium et renvoie (url finale, soup du DOM rendu, erreur)."""
+    from playwright.async_api import TimeoutError as PlaywrightTimeout
+
+    if not await fetcher.allowed(url):
+        return url, None, "interdit par robots.txt"
+    page = await context.new_page()
+    try:
+        async with fetcher.host_slot(url):
+            resp = await page.goto(url, timeout=TIMEOUT * 1000, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=RENDER_WAIT_IDLE_MS)
+            except PlaywrightTimeout:
+                pass  # certains sites ne sont jamais "idle" (analytics, chat) : on prend le DOM tel quel
+        final = page.url
+        if PARKED.search(final):
+            return final, None, "domaine parké / en vente (pas de site actif)"
+        if resp is not None and resp.status >= 400:
+            return final, None, f"HTTP {resp.status}"
+        return final, BeautifulSoup(await page.content(), "lxml"), None
+    finally:
+        await page.close()
+
+
+async def render_site(fetcher: Fetcher, context, site: str, previous: dict) -> dict:
+    out = {"site": site, "final_url": None, "pages": [], "error": None, "rendered": True}
+    start = previous.get("final_url") or site
+    try:
+        final, soup, err = await render_page(fetcher, context, start)
+        out["final_url"] = final
+        if soup is None:
+            out["error"] = err
+            return out
+        out["pages"].append({"url": final, "text": extract_text(soup)})
+        for link in pick_internal_links(soup, final):
+            try:
+                f, s, e = await render_page(fetcher, context, link)
+                if s is not None:
+                    out["pages"].append({"url": f, "text": extract_text(s)})
+                else:
+                    out["pages"].append({"url": f, "text": "", "error": e})
+            except Exception as e:
+                out["pages"].append({"url": link, "text": "", "error": f"{type(e).__name__}: {e}"[:200]})
+    except Exception as e:
+        out["error"] = ("timeout" if "Timeout" in type(e).__name__ else f"{type(e).__name__}: {e}")[:200]
+    return out
+
+
+async def render_all(sites: list[str], cache: Cache) -> None:
+    from playwright.async_api import async_playwright
+
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    async with async_playwright() as pw, httpx.AsyncClient(headers=HEADERS, timeout=TIMEOUT) as client:
+        browser = await pw.chromium.launch(proxy={"server": proxy} if proxy else None)
+        context = await browser.new_context(user_agent=USER_AGENT, locale="fr-FR")
+        await context.route("**/*", lambda route: route.abort() if route.request.resource_type in BLOCKED_RESOURCES
+                            else route.continue_())
+        fetcher = Fetcher(client)  # robots.txt + limites par hôte, partagés avec le navigateur
+        sem = asyncio.Semaphore(RENDER_PARALLEL)
+        n_ok = 0
+
+        async def one(site: str):
+            nonlocal n_ok
+            async with sem:
+                data = await render_site(fetcher, context, site, cache.get(site) or {})
+            if not data["error"] and classify(data).get("nb_mots", 0) >= MIN_WORDS:
+                n_ok += 1
+            cache.put(site, data)  # même en échec : marqué "rendered", il ne sera pas retenté inutilement
+            pbar.update(1)
+            pbar.set_postfix(recuperes=n_ok)
+
+        with tqdm(total=len(sites), desc="Rendu JS", unit="site") as pbar:
+            await asyncio.gather(*(one(s) for s in sites))
+        await browser.close()
+
+
 # --------------------------------------------------------------------------- résultats
 def classify(data: dict | None) -> dict:
     if data is None:
@@ -522,7 +623,8 @@ def classify(data: dict | None) -> dict:
            "erreur": data.get("error") or ""}
     if data.get("error") or n_words < MIN_WORDS:
         if not res["erreur"]:
-            res["erreur"] = f"texte insuffisant ({n_words} mots, site probablement en JavaScript)"
+            res["erreur"] = (f"texte insuffisant même après rendu JavaScript ({n_words} mots)" if data.get("rendered")
+                             else f"texte insuffisant ({n_words} mots, site probablement en JavaScript)")
         res.update({"IA": "indéterminé", "Data": "indéterminé"})
         return res
     ia, dt = score_text(text, IA_COMPILED), score_text(text, DATA_COMPILED)
@@ -601,6 +703,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, help="ne traiter que les N premières entreprises")
     ap.add_argument("--rescore-only", action="store_true", help="pas de téléchargement, recalcule depuis le cache")
     ap.add_argument("--retry-errors", action="store_true", help="re-télécharge les sites en erreur dans le cache")
+    ap.add_argument("--render-js", action="store_true",
+                    help="rend dans Chromium (Playwright) les sites sans texte exploitable (sites en JavaScript)")
     ap.add_argument("--parallel", type=int, default=MAX_PARALLEL_REQUESTS,
                     help=f"requêtes simultanées max (défaut {MAX_PARALLEL_REQUESTS})")
     ap.add_argument("--site-col", default="SITE WEB")
@@ -643,6 +747,16 @@ def main() -> None:
                 asyncio.run(crawl_all(todo, cache))
             except KeyboardInterrupt:
                 print("\nInterrompu : les sites déjà traités sont dans le cache, relancez pour reprendre.")
+
+    if args.render_js:
+        js_sites = [s for s in sites if (c := cache.get(s)) and not c.get("error") and not c.get("rendered")
+                    and classify(c).get("nb_mots", 0) < MIN_WORDS]
+        print(f"{len(js_sites)} sites sans texte exploitable à rendre avec Chromium")
+        if js_sites:
+            try:
+                asyncio.run(render_all(js_sites, cache))
+            except KeyboardInterrupt:
+                print("\nInterrompu : les sites déjà rendus sont dans le cache, relancez pour reprendre.")
 
     results = [classify(cache.get(s)) if s else {"IA": "indéterminé", "Data": "indéterminé", "erreur": "pas de site"}
                for s in df["_site"]]
