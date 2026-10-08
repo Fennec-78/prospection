@@ -530,9 +530,10 @@ def choose_sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
     col = "TRANCHE D’EFFECTIF ENTREPRISE" if "TRANCHE D’EFFECTIF ENTREPRISE" in df.columns else None
     k = n - len(picked)
     if col:
-        others = rest.groupby(col, group_keys=False).apply(
-            lambda g: g.sample(min(len(g), max(1, round(k * len(g) / len(rest)))), random_state=42))
-        others = others.head(k)
+        idx = []
+        for _, g in rest.groupby(col):
+            idx += g.sample(min(len(g), max(1, round(k * len(g) / len(rest)))), random_state=42).index.tolist()
+        others = rest.loc[idx].head(k)
     else:
         others = rest.sample(k, random_state=42)
     return pd.concat([picked, others]).sort_index()
