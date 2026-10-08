@@ -437,6 +437,14 @@ def normalize_site(url: str) -> str | None:
     return f"{p.scheme.lower()}://{p.netloc.lower()}{p.path or '/'}"
 
 
+TRANSIENT = re.compile(r"^(ConnectError|ConnectTimeout|ReadTimeout|ReadError|RemoteProtocolError|PoolTimeout|timeout)"
+                       r"|^HTTP (429|5\d\d)")
+
+
+def is_transient(error: str | None) -> bool:
+    return bool(error) and bool(TRANSIENT.search(error))
+
+
 async def crawl_site(fetcher: Fetcher, site: str) -> dict:
     out = {"site": site, "final_url": None, "pages": [], "error": None}
     try:
@@ -463,14 +471,17 @@ async def crawl_site(fetcher: Fetcher, site: str) -> dict:
         links = pick_internal_links(soup, final)
         out["pages"].append({"url": final, "text": extract_text(soup)})
         for link in links:
-            try:
-                f, s, e = await fetcher.fetch_page(link)
-                if s is not None:
-                    out["pages"].append({"url": f, "text": extract_text(s)})
-                else:
-                    out["pages"].append({"url": f, "text": "", "error": e})
-            except Exception as e:  # une page interne en échec n'invalide pas le site
-                out["pages"].append({"url": link, "text": "", "error": f"{type(e).__name__}: {e}"[:200]})
+            for attempt in range(2):  # une nouvelle tentative si l'erreur est passagère
+                try:
+                    f, s, e = await fetcher.fetch_page(link)
+                    page = {"url": f, "text": extract_text(s)} if s is not None else {"url": f, "text": "", "error": e}
+                except Exception as e:  # une page interne en échec n'invalide pas le site
+                    page = {"url": link, "text": "", "error": f"{type(e).__name__}: {e}"[:200]}
+                if attempt == 0 and is_transient(page.get("error")):
+                    await asyncio.sleep(5 if "429" in page["error"] else 2)
+                    continue
+                break
+            out["pages"].append(page)
     except httpx.TimeoutException:
         out["error"] = "timeout"
     except httpx.ConnectError as e:
@@ -739,7 +750,8 @@ def main() -> None:
         todo = []
         for s in sites:
             c = cache.get(s)
-            if c is None or (args.retry_errors and c.get("error")):
+            page_errors = [p.get("error") for p in (c or {}).get("pages", [])]
+            if c is None or (args.retry_errors and (c.get("error") or any(map(is_transient, page_errors)))):
                 todo.append(s)
         print(f"{len(sites)} sites uniques, {len(sites) - len(todo)} déjà en cache, {len(todo)} à télécharger")
         if todo:
