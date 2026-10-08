@@ -421,18 +421,23 @@ async def crawl_site(fetcher: Fetcher, site: str) -> dict:
     try:
         # https d'abord (la plupart des sites notés http:// dans Kompass redirigent vers https), http en secours
         candidates = [site] if site.startswith("https://") else ["https://" + site[len("http://"):], site]
-        for i, url in enumerate(candidates):
-            try:
-                final, soup, err = await fetcher.fetch_page(url)
-            except httpx.HTTPError:
-                if i == len(candidates) - 1:
-                    raise
-                continue
+        final, soup, errors = None, None, []
+        for url in candidates:
+            for attempt in range(2):  # une nouvelle tentative en cas d'erreur réseau passagère
+                try:
+                    final, soup, err = await fetcher.fetch_page(url)
+                    break
+                except (httpx.TimeoutException, httpx.NetworkError) as e:
+                    err = "timeout" if isinstance(e, httpx.TimeoutException) else f"connexion impossible: {e}"[:120]
+                    if attempt == 0:
+                        await asyncio.sleep(3)
             if soup is not None or err.startswith("interdit"):
+                errors = [err] if soup is None else []
                 break
+            errors.append(f"{urlparse(url).scheme}: {err}" if len(candidates) > 1 else err)
         out["final_url"] = final
         if soup is None:
-            out["error"] = err
+            out["error"] = " / ".join(errors)
             return out
         links = pick_internal_links(soup, final)
         out["pages"].append({"url": final, "text": extract_text(soup)})
