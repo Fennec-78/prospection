@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import re
 import sqlite3
@@ -318,7 +319,7 @@ def pick_internal_links(soup: BeautifulSoup, base_url: str) -> list[str]:
 
 # --------------------------------------------------------------------------- crawler
 class Fetcher:
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(self, client: httpx.AsyncClient | None):
         self.client = client
         self.global_sem = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
         self.host_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -477,24 +478,29 @@ class Cache:
 
 
 async def crawl_all(sites: list[str], cache: Cache) -> None:
-    limits = httpx.Limits(max_connections=MAX_PARALLEL_REQUESTS * 2, max_keepalive_connections=MAX_PARALLEL_REQUESTS)
-    async with httpx.AsyncClient(headers=HEADERS, timeout=TIMEOUT, follow_redirects=False, limits=limits,
-                                 http2=False) as client:
-        fetcher = Fetcher(client)
-        site_sem = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
-        n_err = 0
+    # Un client HTTP par site : une connexion bloquée sur un site lent ne peut pas saturer un pool partagé
+    # (sinon l'attente d'une connexion libre finit en "timeout" pour des sites qui répondent très bien).
+    # Les limites (10 requêtes en parallèle, 1 req/s par hôte) et le cache robots.txt restent communs.
+    shared = Fetcher(None)
+    ssl_ctx = httpx.create_ssl_context()
+    site_sem = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
+    n_err = 0
 
-        async def one(site: str):
-            async with site_sem:
+    async def one(site: str):
+        nonlocal n_err
+        async with site_sem:
+            async with httpx.AsyncClient(headers=HEADERS, timeout=TIMEOUT, follow_redirects=False,
+                                         verify=ssl_ctx) as client:
+                fetcher = copy.copy(shared)
+                fetcher.client = client
                 data = await crawl_site(fetcher, site)
-            cache.put(site, data)
-            nonlocal n_err
-            n_err += bool(data["error"])
-            pbar.update(1)
-            pbar.set_postfix(erreurs=n_err)
+        cache.put(site, data)
+        n_err += bool(data["error"])
+        pbar.update(1)
+        pbar.set_postfix(erreurs=n_err)
 
-        with tqdm(total=len(sites), desc="Sites", unit="site") as pbar:
-            await asyncio.gather(*(one(s) for s in sites))
+    with tqdm(total=len(sites), desc="Sites", unit="site") as pbar:
+        await asyncio.gather(*(one(s) for s in sites))
 
 
 # --------------------------------------------------------------------------- résultats
