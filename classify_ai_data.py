@@ -221,6 +221,7 @@ def score_text(text: str, compiled) -> dict:
         "score": round(score, 1),
         "n_strong": n_strong,
         "strong_score": strong,
+        "medium_score": medium,
         "keywords": "; ".join(f"{k}×{n}" if n > 1 else k for k, n in detail),
         "strong_keywords": "; ".join(k for k, _ in detail if weights[k] >= STRONG),
     }
@@ -234,7 +235,7 @@ def decide(s: dict) -> str:
         return "oui"
     if s["n_strong"] >= 1 and s["score"] >= THRESHOLD_PROBABLE:
         return "probable"
-    if s["n_strong"] == 0 and s["score"] - min(s["score"], MAX_WEAK_TOTAL) >= 2 * THRESHOLD_PROBABLE:
+    if s["n_strong"] == 0 and s["medium_score"] >= 2 * THRESHOLD_PROBABLE:
         return "probable"
     return "non"
 
