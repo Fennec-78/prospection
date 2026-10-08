@@ -476,7 +476,7 @@ async def crawl_all(sites: list[str], cache: Cache) -> None:
     async with httpx.AsyncClient(headers=HEADERS, timeout=TIMEOUT, follow_redirects=False, limits=limits,
                                  http2=False) as client:
         fetcher = Fetcher(client)
-        site_sem = asyncio.Semaphore(MAX_PARALLEL_REQUESTS * 3)
+        site_sem = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
         n_err = 0
 
         async def one(site: str):
@@ -580,6 +580,7 @@ def choose_sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 
 def main() -> None:
+    global MAX_PARALLEL_REQUESTS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", type=Path)
     ap.add_argument("-o", "--output", type=Path, help="fichier Excel de sortie (défaut : <input>_ia_data.xlsx)")
@@ -588,10 +589,13 @@ def main() -> None:
     ap.add_argument("--limit", type=int, help="ne traiter que les N premières entreprises")
     ap.add_argument("--rescore-only", action="store_true", help="pas de téléchargement, recalcule depuis le cache")
     ap.add_argument("--retry-errors", action="store_true", help="re-télécharge les sites en erreur dans le cache")
+    ap.add_argument("--parallel", type=int, default=MAX_PARALLEL_REQUESTS,
+                    help=f"requêtes simultanées max (défaut {MAX_PARALLEL_REQUESTS})")
     ap.add_argument("--site-col", default="SITE WEB")
     ap.add_argument("--filter-col", default="categorie", help="colonne de filtre (insensible à la casse)")
     ap.add_argument("--filter-values", default="OK,A_VERIFIER")
     args = ap.parse_args()
+    MAX_PARALLEL_REQUESTS = max(1, min(args.parallel, MAX_PARALLEL_REQUESTS))
 
     output = args.output or args.input.with_name(args.input.stem + "_ia_data.xlsx")
     cache_path = args.cache or args.input.with_name(args.input.stem + "_cache.sqlite")
