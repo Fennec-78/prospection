@@ -118,6 +118,9 @@ IA_KEYWORDS = [
     KW(r"retrieval[- ]augmented generation", "RAG", STRONG),
     KW(r"\b(chat ?gpt|gpt-?[345]o?|openai|mistral ai|hugging ?face|langchain|tensorflow|pytorch|scikit-learn)\b",
        "outils IA (GPT, PyTorch...)", STRONG),
+    KW(r"\b(data|donnees?) (&|et) (ia|ai)\b|\b(ia|ai) (&|et) data\b|gouvernance (de l.)?ia\b|\bia gouvernance|"
+       r"ai governance|\bia (responsable|ethique|de confiance)|responsible ai|trustworthy ai", "Data & IA / gouvernance IA",
+       STRONG),
     KW(r"\bIA\b", "IA", MEDIUM, True),
     KW(r"\bA\.?I\.?\b(?![-\.]?\w)", "AI", MEDIUM, True),
     KW(r"\bchat ?bots?\b|agents? conversationnels?|assistants? (virtuels?|conversationnels?)", "chatbot", MEDIUM),
@@ -152,8 +155,8 @@ DATA_KEYWORDS = [
     KW(r"\bsnowflake\b|\bdatabricks\b|\bhadoop\b|\bapache spark\b|\bpyspark\b|\bkafka\b|\bbigquery\b|\btalend\b|"
        r"\binformatica\b|\bdataiku\b|\bairflow\b|\bdbt\b|\bredshift\b|\bsynapse\b|\bazure data factory\b|\bsas viya\b",
        "outils data (Snowflake, Databricks...)", STRONG),
-    KW(r"\banalytics\b|data[- ]analytics|analyse (de|des) donnees|analyse de la donnee|advanced analytics",
-       "analytics", STRONG),
+    KW(r"data[- ]analytics|advanced analytics|analyse (de|des) donnees|analyse de la donnee", "data analytics", STRONG),
+    KW(r"(?<!web )(?<!google )(?<!marketing )\banalytics\b", "analytics", MEDIUM),
     KW(r"data[- ]driven|pilotage par la donnee|culture (de la )?data|strategie data|valorisation (de vos |des )?donnees|"
        r"valoriser (vos|les) donnees|exploitation (de vos |des )donnees", "data-driven / valorisation", MEDIUM),
     KW(r"\bETL\b|\bELT\b", "ETL", MEDIUM, True),
@@ -256,9 +259,24 @@ def extract_text(soup: BeautifulSoup) -> str:
         if m and m.get("content"):
             parts.append(m["content"])
     body = soup.body or soup
-    parts.append(body.get_text(" ", strip=True))
-    text = re.sub(r"\s+", " ", " ".join(parts)).strip()
-    return text[:MAX_TEXT_CHARS]
+    parts += body.get_text("\n", strip=True).split("\n")
+    lines = (re.sub(r"\s+", " ", ln).strip() for ln in parts)
+    return "\n".join(ln for ln in lines if ln)[:MAX_TEXT_CHARS]
+
+
+PARKED = re.compile(r"/lander\b|sedoparking|parkingcrew|bodis\.com|dan\.com|afternic|hugedomains|"
+                    r"domain-?for-?sale|domaine-a-vendre", re.I)
+
+
+def html_redirect_target(soup: BeautifulSoup, html: str) -> str | None:
+    """Cible d'une redirection faite en HTML (meta refresh) ou en JavaScript (window.location = ...)."""
+    meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+    if meta and meta.get("content"):
+        m = re.search(r"url\s*=\s*['\"]?([^'\";]+)", meta["content"], re.I)
+        if m:
+            return m.group(1).strip()
+    m = re.search(r"(?:window\.|document\.)?location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", html)
+    return m.group(1) if m else None
 
 
 def reg_host(url: str) -> str:
@@ -350,10 +368,8 @@ class Fetcher:
                 rp: RobotFileParser | None = RobotFileParser()
                 try:
                     r = await self.get(origin + "/robots.txt")
-                    if r.status_code in (401, 403):
-                        rp.disallow_all = True
-                    elif r.status_code >= 400 or not r.content:
-                        rp.allow_all = True
+                    if r.status_code >= 400 or not r.content:
+                        rp.allow_all = True  # RFC 9309 : robots.txt absent ou 4xx => pas de restriction
                     else:
                         rp.parse(r.content.decode(r.encoding or "utf-8", "replace").splitlines())
                 except Exception:
@@ -362,7 +378,8 @@ class Fetcher:
         rp = self.robots[origin]
         return True if rp is None else rp.can_fetch(USER_AGENT, url)
 
-    async def fetch_page(self, url: str) -> tuple[str, BeautifulSoup | None, str | None]:
+    async def fetch_page(self, url: str, follow_html_redirect: bool = True
+                         ) -> tuple[str, BeautifulSoup | None, str | None]:
         """Retourne (url finale, soup, erreur)."""
         if not await self.allowed(url):
             return url, None, "interdit par robots.txt"
@@ -375,7 +392,16 @@ class Fetcher:
         html = r.content.decode(r.encoding or "utf-8", "replace") if r.content else ""
         if not html:
             return final, None, "page vide"
-        return final, BeautifulSoup(html, "lxml"), None
+        soup = BeautifulSoup(html, "lxml")
+        if follow_html_redirect and len(soup.get_text(" ", strip=True).split()) < MIN_WORDS:
+            target = html_redirect_target(soup, html)
+            if target:
+                target = urljoin(final, target)
+                if PARKED.search(target):
+                    return final, None, "domaine parké / en vente (pas de site actif)"
+                if target.rstrip("/") != final.rstrip("/"):
+                    return await self.fetch_page(target, follow_html_redirect=False)
+        return final, soup, None
 
 
 def normalize_site(url: str) -> str | None:
@@ -393,12 +419,17 @@ def normalize_site(url: str) -> str | None:
 async def crawl_site(fetcher: Fetcher, site: str) -> dict:
     out = {"site": site, "final_url": None, "pages": [], "error": None}
     try:
-        final, soup, err = await fetcher.fetch_page(site)
-        if soup is None and site.startswith("http://") and err and not err.startswith("interdit"):
-            # certains sites ne répondent qu'en https
-            final2, soup2, err2 = await fetcher.fetch_page("https://" + site[len("http://"):])
-            if soup2 is not None:
-                final, soup, err = final2, soup2, None
+        # https d'abord (la plupart des sites notés http:// dans Kompass redirigent vers https), http en secours
+        candidates = [site] if site.startswith("https://") else ["https://" + site[len("http://"):], site]
+        for i, url in enumerate(candidates):
+            try:
+                final, soup, err = await fetcher.fetch_page(url)
+            except httpx.HTTPError:
+                if i == len(candidates) - 1:
+                    raise
+                continue
+            if soup is not None or err.startswith("interdit"):
+                break
         out["final_url"] = final
         if soup is None:
             out["error"] = err
@@ -446,14 +477,16 @@ async def crawl_all(sites: list[str], cache: Cache) -> None:
                                  http2=False) as client:
         fetcher = Fetcher(client)
         site_sem = asyncio.Semaphore(MAX_PARALLEL_REQUESTS * 3)
+        n_err = 0
 
         async def one(site: str):
             async with site_sem:
                 data = await crawl_site(fetcher, site)
             cache.put(site, data)
+            nonlocal n_err
+            n_err += bool(data["error"])
             pbar.update(1)
-            if data["error"]:
-                pbar.set_postfix_str(f"erreur {site[:40]}: {data['error'][:40]}")
+            pbar.set_postfix(erreurs=n_err)
 
         with tqdm(total=len(sites), desc="Sites", unit="site") as pbar:
             await asyncio.gather(*(one(s) for s in sites))
@@ -464,7 +497,14 @@ def classify(data: dict | None) -> dict:
     if data is None:
         return {"IA": "indéterminé", "Data": "indéterminé", "erreur": "non traité"}
     pages = [p for p in data.get("pages", []) if p.get("text")]
-    text = " \n ".join(p["text"] for p in pages)
+    # un même bloc (menu, pied de page, bandeau) répété sur chaque page n'est compté qu'une fois
+    seen, blocks = set(), []
+    for p in pages:
+        for ln in p["text"].split("\n"):
+            if ln not in seen:
+                seen.add(ln)
+                blocks.append(ln)
+    text = "\n".join(blocks)
     n_words = len(text.split())
     res = {"pages": " | ".join(p["url"] for p in pages), "nb_mots": n_words, "url_finale": data.get("final_url"),
            "erreur": data.get("error") or ""}
